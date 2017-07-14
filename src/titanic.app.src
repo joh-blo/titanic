@@ -1,0 +1,9 @@
+%%% -*- erlang -*-
+{application,titanic,
+ [{description,"Titan helper utils"},
+  {vsn,"%VSN%"},
+  {modules,[%MODULES%]},
+  {registered,[titanic_sup]},
+  {env,[{db_path,"/tmp"}]},
+  {applications,[kernel,stdlib]},
+  {mod,{titanic_app,[]}}]}.
