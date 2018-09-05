@@ -11,8 +11,9 @@
 -behaviour(gen_statem).
 
 %% API
--export([parse/4,
-	 process/2]).
+-export([do/4
+%	 process/2
+]).
 
 %% gen_statem callbacks
 -export([callback_mode/0,init/1,terminate/3, code_change/4]).
@@ -20,6 +21,7 @@
 -export(['TITAN_Project_File_Information'/3,
 	 'ProjectName'/3,
 	 'ReferencedProjects'/3,
+	 'Folders'/3,
 	 'Files'/3,
 	 'ActiveConfiguration'/3,
 	 'Configurations'/3
@@ -33,32 +35,53 @@
 
 %% User State for xmerl scanning
 -record(state,{
-%	  mode,     % (initial | expanding | off) Parsing mode
-	  base,     % Base path for the TPD
-	  tool_path,% Relative path from tool
-	  tpd       % #tpd{}, a complete parsed TPD
+	  opt,          % (validate|flatten|customize|external) Parsing mode
+	  root,         % Absolute path to repo root in local environment
+	  tpd           % #tpd{}, a complete parsed TPD
          }).
 
-parse(Content0,Mode,Base,ToolPath) ->
-    Pid=start_parser(Mode,Base,ToolPath),
-    io:format("JB STARTING PARSER ~p~n",[Pid]),
+
+do(Root,ProjPath,Updates,Opt) ->
+    case parse(Root,ProjPath,Opt) of
+	Res when is_record(Res,tpd) ->
+	    if
+		Opt==flatten ->
+		    TPD=process_tpd_flatten(Res,Updates),
+		    create_xml(TPD);
+		Opt==validate ->
+		    Res
+	    end;
+	Res ->
+	    Res
+    end.
+
+
+%% Parse a TPD file (an XML standard to control building a binary from TTCN-3)
+parse(Root,ProjPath,Opt) ->
+    TPDfileIn=filename:basename(ProjPath),
+    TPDfileDir=filename:dirname(ProjPath),
+    FilePath=filename:join([Root,ProjPath]),
+    case file:read_file(FilePath) of
+	{ok,Content} ->
+	    do_parse(Content,Root,TPDfileDir,Opt);
+	Error ->
+	    io:format("Cannot read~n"
+		      " ~p from~n"
+		      " ~p,~n"
+		      " got ~p~n",[TPDfileIn,FilePath,Error]),
+	    false
+    end.
+
+
+
+do_parse(Content0,Root,TPDfileDir,Opt) ->
+    Pid=start_parser(Root,TPDfileDir,Opt),
     Content=if
 		is_binary(Content0) -> binary_to_list(Content0);
 		is_list(Content0) -> Content0
 	    end,
 
     {_Mode,_InCharset,C1}=xmerl_lib:detect_charset(undefined,Content),
-%    io:format("~p:parse _Mode=~p~n _InCharset=~p~n",[?MODULE,_Mode,_InCharset]),
-    %% Hook=fun(ParsedEntity, S) ->
-    %% 		 export_element(Pid,ParsedEntity),
-    %% 		 %% if
-    %% 		 %%     is_record(ParsedEntity,xmlText) ->
-    %% 		 %% 	 ok;
-    %% 		 %%     true ->
-    %% 		 %% 	 export_element(Pid,ParsedEntity)
-    %% 		 %% end,
-    %% 		 {ParsedEntity,S}
-    %% 	 end,
     Event=fun(#xmerl_event{event=E,data=Data},S) when is_record(Data,xmlDecl) ->
 		  if
 		      E==ended -> export_element(Pid,E,unknown,Data);
@@ -67,48 +90,94 @@ parse(Content0,Mode,Base,ToolPath) ->
     		  S;
 	     (#xmerl_event{data=Data},S) when is_record(Data,xmlAttribute) ->
 		  S;
-	     (X=#xmerl_event{event=ended,data=document},S) ->
-		  io:format("Document ended ~p~n",[X]),
+	     (#xmerl_event{event=ended,data=document},S) ->
 		  S;
-	     (EV=#xmerl_event{event=Event,data=Data},S) ->
+	     (#xmerl_event{event=Event,data=Data},S) ->
 		  Name=case Data of
 			   #xmlElement{name=N} ->
-%			       io:format("Event=~p~n",[EV]),
 			       N;
 			   #xmlText{parents=[{N,_}|_]} -> N;
 			   #xmlComment{parents=[{N,_}|_]} -> N;
 			   _ ->
-			       io:format("Event=~p~n",[EV]),
 			       unknown
 		       end,
     		  export_element(Pid,Event,Name,Data),
     		  S
-	     %% (#xmerl_event{event=Event,data=Data},S) ->
-	     %% 	  io:format("Event=~p~n Data=~p~n",[Event,Data]),
-    	     %% 	  S
     	  end,
     xmerl_scan:string(C1,[{event_fun,Event}]),
-    io:format("JB STOPPING PARSER ~p~n",[Pid]),
     stop_parser(Pid).
 
 
-process(TPD=#tpd{ref_projects=RefProjects},flatten) ->
-    process_tpd_flatten(RefProjects,TPD#tpd{ref_projects=[]}).
 
 
-process_tpd_flatten([],TPD) ->
-    TPD;
-process_tpd_flatten([{#xmlElement{attributes=OldA,parents=Par,
-				  pos=Pos,language=Lang},
-		      #tpd{files=RefFiles}}|Rest],
-		    TPD=#tpd{files=Files}) ->
+%% Creates a single "flat" TPD, from a TPD "tree" 
+process_tpd_flatten(Res=#tpd{path=TPDfileDir,
+			     ref_projects=RefProjects,
+			     files=Files0},Updates) ->
+    Files1=process_tpd_flatten2(Files0,TPDfileDir,Updates,[]),
+    {TPD,_}=process_tpd_flatten1(RefProjects,
+				 Updates,
+				 Res#tpd{ref_projects=[],
+					 files=Files1},
+				 []),
+    TPD.
+
+process_tpd_flatten1([],_Updates,TPD,AllProjs) ->
+    {TPD,AllProjs};
+process_tpd_flatten1([{#xmlElement{attributes=OldA,parents=Par,
+				   pos=Pos,language=Lang},
+		       TPD=#tpd{ref_projects=RefProjects,
+				path=TPDfileDir}}|Rest],
+		     Updates,
+		     OrgTPD=#tpd{files=Files0},
+		     AllProjs0) ->
     Name=lookup_attribute(name,OldA),
-    Comm=#xmlComment{value="From "++Name,
-		     parents=Par,pos=Pos,language=Lang},
-    NewTPD=TPD#tpd{files=Files++[#xmlText{value="\n"},Comm|
-				 lists:reverse(RefFiles)]},
-    process_tpd_flatten(Rest,NewTPD).
+    case lists:member(Name,AllProjs0) of
+	false ->
+	    {#tpd{files=Files1},AllProjs1}=
+		process_tpd_flatten1(RefProjects,Updates,
+				     TPD#tpd{ref_projects=[]},
+				     AllProjs0),
 
+	    Comm=#xmlComment{value="From "++Name,
+			     parents=Par,pos=Pos,language=Lang},
+	    NewFiles=
+		Files0++
+		[#xmlText{value="\n"},Comm]++
+		process_tpd_flatten2(Files1,TPDfileDir,Updates,[]),
+	    NewTPD=OrgTPD#tpd{files=NewFiles},
+	    process_tpd_flatten1(Rest,Updates,NewTPD,AllProjs1);
+	true ->
+	    process_tpd_flatten1(Rest,Updates,OrgTPD,AllProjs0)
+    end;
+process_tpd_flatten1(Other,_Updates,TPD,_) ->
+    io:format("ERROR: Other=~p~n",[Other]),
+    TPD.
+
+
+process_tpd_flatten2([],_TPDfileDir,_Updates,Out) ->
+    lists:reverse(Out);
+process_tpd_flatten2([E=#xmlElement{attributes=OldA}|Rest],
+		     TPDfileDir,Updates,Out) ->
+    OldPath=lookup_attribute(relativeURI,OldA),
+    NewPath=filename:join(TPDfileDir,OldPath),
+    Path=apply_updates(Updates,NewPath),
+
+    NewA=update_attribute(relativeURI,Path,OldA),
+    NewE=E#xmlElement{attributes=NewA},
+    process_tpd_flatten2(Rest,TPDfileDir,Updates,[NewE|Out]);
+process_tpd_flatten2([E|Rest],TPDfileDir,Updates,Out) ->
+    process_tpd_flatten2(Rest,TPDfileDir,Updates,[E|Out]).
+
+
+apply_updates([],Path) ->
+    Path;
+apply_updates([{"",Val}|Rest],Path) ->
+    NewPath=filename:join(Val,Path),
+    apply_updates(Rest,NewPath);
+apply_updates([{Match,Val}|Rest],Path) ->
+    NewPath=filename:join(Val,string:prefix(Path,Match)),
+    apply_updates(Rest,NewPath).
 
 
 
@@ -125,10 +194,9 @@ process_tpd_flatten([{#xmlElement{attributes=OldA,parents=Par,
 %% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
 %% @end
 %%--------------------------------------------------------------------
-start_parser(Mode,Base,ToolPath) ->
-    case gen_statem:start_link(?MODULE,[Mode,Base,ToolPath],[]) of
+start_parser(Root,TPDfileDir,Opt) ->
+    case gen_statem:start_link(?MODULE,[Root,TPDfileDir,Opt],[]) of
 	{ok,Pid} ->
-	    io:format("start_parser ~p started!~n",[Pid]),
 	    Pid;
 	{already_started,Pid} ->
 	    io:format("start_parser ~p already started!~n",[Pid]),
@@ -160,12 +228,11 @@ callback_mode() -> state_functions.
 %% @end
 -spec init(Args :: term()) ->
 		  gen_statem:init_result(atom()).
-init([Mode,Base,ToolPath]) ->
+init([Root,TPDfileDir,Opt]) ->
     {ok,'TITAN_Project_File_Information',
-     #state{% mode=Mode,
-	    base=Base,
-	    tool_path=ToolPath,
-	    tpd=#tpd{}
+     #state{opt=Opt,
+	    root=Root,
+	    tpd=#tpd{path=shorten_path(TPDfileDir)}
 	   }}.
 
 %%--------------------------------------------------------------------
@@ -183,27 +250,28 @@ init([Mode,Base,ToolPath]) ->
 		  gen_statem:event_handler_result(atom()).
 'TITAN_Project_File_Information'(cast,{next_state,Loc},State) ->
     %% Found another element inside 
-    io:format("'TITAN_Project_File_Information' ==> ~p~n",[Loc]),
     {next_state,Loc, State};
-%% 'TITAN_Project_File_Information'(cast,E,State=#state{mode=initial,tpd=Tpd})
 'TITAN_Project_File_Information'(cast,E,State=#state{tpd=Tpd})
   when is_record(E,xmlComment);is_record(E,xmlDecl);
        is_record(E,xmlPI);is_record(E,xmlText) ->
     %% Declarations assumed to be on the top level.
     NewTpd=Tpd#tpd{closure=[E|Tpd#tpd.closure]},
     {next_state,'TITAN_Project_File_Information', State#state{tpd=NewTpd}};
-%%V 'TITAN_Project_File_Information'(cast,E,State=#state{mode=initial,tpd=Tpd})
 'TITAN_Project_File_Information'(cast,E,State=#state{tpd=Tpd})
   when is_record(E,xmlElement) ->
-%    Content=lookup_cache('TITAN_Project_File_Information',Cache),
-%    NewE=E#xmlElement{content=Content},
     NewTpd=Tpd#tpd{closure=[E#xmlElement{content=[]}|Tpd#tpd.closure]},
     {next_state,'TITAN_Project_File_Information',
      State#state{tpd=NewTpd}};
-'TITAN_Project_File_Information'({call,From},stop,#state{tpd=Tpd}) ->
-    io:format("'TITAN_Project_File_Information' Returning from ~p~n |Tpd.files|=~p~n",
-	      [self(),length(Tpd#tpd.files)]),
-    {stop_and_reply,normal,{reply,From,Tpd}};
+'TITAN_Project_File_Information'({call,From},stop,#state{opt=Opt,
+							 tpd=Tpd}) ->
+    Res=if
+	    Opt==validate ->
+		titanic_manager:status(validate);
+	    true ->
+		Tpd#tpd{ref_projects=lists:reverse(Tpd#tpd.ref_projects),
+			files=lists:reverse(Tpd#tpd.files)}
+	end,
+    {stop_and_reply,normal,{reply,From,Res}};
 ?HANDLE_COMMON.
 
 
@@ -218,39 +286,46 @@ init([Mode,Base,ToolPath]) ->
 %%   thus not stored explicitly.
 %% - All relative paths must be copied and extended, in all references.
 'ReferencedProjects'(cast,E=#xmlElement{name='ReferencedProject'},
-		     State=#state{tpd=Tpd,base=Base,% mode=Mode,
-				  tool_path=ToolPath}) ->
-    %% Expand and merge the ReferencedProject!
-    RefTpd=expand_element(projectLocationURI,Base,E,ToolPath),
-    NewTpd=Tpd#tpd{ref_projects=[{E,RefTpd}|Tpd#tpd.ref_projects]},
+		     State=#state{opt=Opt,
+				  tpd=Tpd=#tpd{path=TPDfileDir,
+					       ref_projects=RefProjects},
+				  root=Root
+				 }) ->
+    %% Expand the ReferencedProject
+    RefTpd=expand_project(E,Root,TPDfileDir,Opt),
+    NewTpd=Tpd#tpd{ref_projects=[{E,RefTpd}|RefProjects]},
     NewState=State#state{tpd=NewTpd},
     {next_state,'ReferencedProjects', NewState};
 'ReferencedProjects'(cast,E=#xmlElement{name='ReferencedProjects'},State)
   when is_record(E,xmlElement) ->
-    io:format("'ReferencedProjects' ==> 'TITAN_Project_File_Information'~n",[]),
     {next_state,'TITAN_Project_File_Information', State};
 ?HANDLE_COMMON.
+
+
+'Folders'(cast,E=#xmlElement{name='Folders'},State)
+  when is_record(E,xmlElement) ->
+    {next_state,'TITAN_Project_File_Information', State};
+'Folders'(cast,_E,State) ->
+    {next_state,'Folders', State};
+?HANDLE_COMMON.
+
 
 
 %% Files is a container element, holding a set of FileResource elements and
 %% nothing else.
 'Files'(cast,E=#xmlElement{name='FileResource'},
-	State=#state{tpd=Tpd,base=Base}) ->
-    %% FIXME! Expand any paths in FileResource!
-    NewE=update_path_in_element(relativeURI,Base,E),
-%    io:format("EXPAND OLD:~p~n  NEW:~p~n",[E,NewE]),
-%    NewCache=update_cache('Files',[NewE],Cache),
-    NewTpd=Tpd#tpd{files=[NewE|Tpd#tpd.files]},
+	State=#state{tpd=Tpd=#tpd{name=TpdName,
+				  path=TPDfileDir,
+				  files=Files},
+		     root=Root
+		    }) ->
+    check_file(E,TpdName,Root,TPDfileDir),
+    NewTpd=Tpd#tpd{files=[E|Files]},
     {next_state,'Files', State#state{tpd=NewTpd}};
 'Files'(cast,E,State)
   when is_record(E,xmlElement) ->
-    %% Content=lookup_cache('Files',Cache),
-    %% NewE=E#xmlElement{content=Content},
-    %% NewCache=update_cache('TITAN_Project_File_Information',[NewE],Cache),
-    io:format("'Files' ==> 'TITAN_Project_File_Information'~n",[]),
     {next_state,'TITAN_Project_File_Information', State};
 'Files'(cast,E,State=#state{tpd=Tpd}) ->
-    %% NewCache=update_cache('Files',[E],Cache),
     NewTpd=Tpd#tpd{files=[E|Tpd#tpd.files]},
     {next_state,'Files', State#state{tpd=NewTpd}};
 ?HANDLE_COMMON.
@@ -259,7 +334,6 @@ init([Mode,Base,ToolPath]) ->
 %% Anything else in the 'TITAN_Project_File_Information' element
 'ProjectName'(cast,E=#xmlElement{name='ProjectName'},State=#state{tpd=Tpd}) ->
     NewTpd=Tpd#tpd{name=E},
-    io:format("'ProjectName' ==> 'TITAN_Project_File_Information'~n",[]),
     {next_state,'TITAN_Project_File_Information', State#state{tpd=NewTpd}};
 ?HANDLE_COMMON.
 
@@ -267,23 +341,21 @@ init([Mode,Base,ToolPath]) ->
 'ActiveConfiguration'(cast,E=#xmlElement{name='ActiveConfiguration'},
 		      State=#state{tpd=Tpd}) ->
     NewTpd=Tpd#tpd{active_config=E},
-    io:format("'ActiveConfiguration' E=~p~n",[E]),
-    io:format("'ActiveConfiguration' ==> 'TITAN_Project_File_Information'~n",[]),
     {next_state,'TITAN_Project_File_Information', State#state{tpd=NewTpd}};
 ?HANDLE_COMMON.
 
 
-'Configurations'(cast,E=#xmlElement{name='Configurations'},
+'Configurations'(cast,E=#xmlElement{name='Configuration'},
 		 State=#state{tpd=Tpd}) ->
-%    io:format("Configurations-1 ~n E=~p~n S=~p~n",[E, State]),
-    NewTpd=Tpd#tpd{configs=E},
-    io:format("'Configurations' ==> 'TITAN_Project_File_Information'~n",[]),
-    {next_state,'TITAN_Project_File_Information', State#state{tpd=NewTpd}};
+    NewTpd=Tpd#tpd{configs=[E|Tpd#tpd.configs]},
+    {next_state,'Configurations', State#state{tpd=NewTpd}};
+'Configurations'(cast,#xmlElement{name='Configurations'},State) ->
+    {next_state,'TITAN_Project_File_Information', State};
 ?HANDLE_COMMON.
 
 
 handle_common(cast,_,S,L) ->
-    %% Ignore anything does not need any special handling.
+    %% Ignore anything that does not need any special handling.
     {next_state,L,S};
 handle_common(T,E,S,L) ->
     io:format("handle_common~n T=~p~n E=~p~n S=~p~n L=~p~n",[T,E,S,L]),
@@ -329,14 +401,11 @@ export_element(Pid,E,Name,ParsedEntity) ->
 	is_record(ParsedEntity,xmlDecl);
 	is_record(ParsedEntity,xmlComment) ->
 	    ok;
-	Name==unknown ->
-      io:format("export_element~n E=~p~n ParsedEntity=~p~n",[E,ParsedEntity]);
 	true ->
 	    ok
     end,
     if
 	E==started,is_record(ParsedEntity,xmlElement) ->
-%	    io:format("export_element IN ~p:~p:~p~n",[Pid,Name,E]),
 	    gen_statem:cast(Pid,{next_state,Name});
 	E==ended->
 	    gen_statem:cast(Pid,ParsedEntity);
@@ -345,46 +414,87 @@ export_element(Pid,E,Name,ParsedEntity) ->
     end.
 
 stop_parser(Pid) ->
-    A=gen_statem:call(Pid,stop,infinity),
-    io:format("stop_parser in ~p, got from ~p~n |Tpd.files|=~p~n",
-	      [self(),Pid,length(A#tpd.files)]),
-
-    A.
+    gen_statem:call(Pid,stop,infinity).
 
 
 %%% ============================================================================
-%% Here goes the handling of all elements
+%% Update paths etc. in the elements
+
+check_file(#xmlElement{attributes=OldA},TpdName,Root,TPDfileDir) ->
+    OldPath=lookup_attribute(relativeURI,OldA),
+    FilePath=shorten_path(filename:join([Root,TPDfileDir,OldPath])),
+    ProjName=projname(TpdName),
+    titanic_manager:check_file(FilePath,ProjName).
+
+
+expand_project(#xmlElement{attributes=OldA},Root,TPDfileDir,Opt) ->
+    RelativeProjPath=lookup_attribute(projectLocationURI,OldA),
+    ProjPath=filename:join([TPDfileDir,RelativeProjPath]),
+    FilePath=shorten_path(filename:join([Root,ProjPath])),
+    titanic_manager:check_project(FilePath),
+    parse(Root,ProjPath,Opt).
+
+
 
 %%% ----------------------------------------------------------------------------
-%% lookup_cache(Name,Cache) ->
-%%     proplists:get_value(Name,Cache,[]).
+%% Creates a TPD file (XML file) from a #tpd{} record
+create_xml(TPD=#tpd{closure=Closure}) ->
+    L=create_xml_closure(Closure,TPD,[]),
+    titanic_xmerl:export(L,titanic_xmerl_xml).
 
-%% update_cache(Name,ExpandedE,Cache) ->
-%%     case proplists:get_value(Name,Cache) of
-%% 	undefined ->
-%% 	    [{Name,ExpandedE}|Cache];
-%% 	Content ->
-%% 	    lists:keyreplace(Name,1,Cache,{Name,Content++ExpandedE})
-%%     end.
+%% Note that the closure list is in reverse order since parsing 
+create_xml_closure([],_TPD,Out) ->
+    Out;
+create_xml_closure([E=#xmlElement{name='TITAN_Project_File_Information',
+				  content=_Content}|Rest],
+		   TPD=#tpd{name=Name,
+			    ref_projects=RefProjects,
+			    files=FileRes,
+			    active_config=ActiveConfig,
+			    configs=Configs0
+			   },Out) ->
+    RefProj=if
+		RefProjects==[] ->
+		    [];
+		true ->
+		    [#xmlText{value="\n"},
+		     #xmlElement{name='ReferencedProjects',
+				 content=RefProjects}]
+	    end,
+    Files=if
+	      FileRes==[] ->
+		  [];
+	      true ->
+		  [#xmlText{value="\n"},
+		   #xmlElement{name='Files',
+			       content=FileRes}]
+	  end,
+    ActConf=if
+		ActiveConfig==[] ->
+		    [];
+		true ->
+		    [#xmlText{value="\n"},ActiveConfig]
+	    end,
+    Configs=if
+     		Configs0==[] ->
+     		    Configs0;
+     		true ->
+     		    [#xmlText{value="\n"}|Configs0]
+     	    end,
+
+    NewContent=[#xmlText{value="\n"},Name]++
+	RefProj++
+	Files++
+	ActConf++
+	Configs++[#xmlText{value="\n"}],
+    NewE=E#xmlElement{content=NewContent},
+    create_xml_closure(Rest,TPD,[NewE|Out]);
+create_xml_closure([H|Rest],TPD,Out) ->
+    create_xml_closure(Rest,TPD,[H|Out]).
 
 
-update_path_in_element(AttrName,Base,E=#xmlElement{attributes=OldA}) ->
-    OldPath=lookup_attribute(AttrName,OldA),
-    NewPath=filename:join(Base,OldPath),
-%    io:format("~p + ~p = ~p~n",[Base,OldPath,NewPath]),
-    NewA=update_attribute(AttrName,NewPath,OldA),
-    E#xmlElement{attributes=NewA}.
-
-expand_element(AttrName,Base,
-	       E=#xmlElement{attributes=OldA,parents=Par,pos=Pos,language=Lang},
-	       ToolPath) ->
-    %% We should have a coresponding .file file here as well
-    OldPath=lookup_attribute(AttrName,OldA),
-    NewPath=filename:join(Base,OldPath),
-    NewBase=filename:dirname(NewPath),
-    titanic:parse_tpd(NewPath,expanding,NewBase,ToolPath).
-
-
+%%% ----------------------------------------------------------------------------
+%% Utillities
 
 %%% Lookup attributes in Attribute list returned by xmerl.
 lookup_attribute(K,[#xmlAttribute{name=K,value=V}|Attrs]) ->
@@ -401,4 +511,22 @@ update_attribute(K,NewV,Attrs) ->
 	    NewA=A#xmlAttribute{value=NewV},
 	    lists:keyreplace(K,#xmlAttribute.name,Attrs,NewA)
     end.
+
+
+projname(#xmlElement{name='ProjectName',
+		     content=[#xmlText{value=Content}]}) ->
+    Content.
+
+
+
+%% Remove any ".." in a path, if possible.
+shorten_path(Path) ->
+    shorten_path2(filename:split(Path),[]).
+
+shorten_path2([],Out) ->
+    filename:join(lists:reverse(Out));
+shorten_path2([".."|Rest],[_|Out]) ->
+    shorten_path2(Rest,Out);
+shorten_path2([H|Rest],Out) ->
+    shorten_path2(Rest,[H|Out]).
 

@@ -8,6 +8,9 @@ APP_NAME = titanic
 
 MODULES= \
 	titanic \
+	titanic_app \
+	titanic_sup \
+	titanic_manager \
 	titanic_tpd \
 	titanic_xmerl \
 	titanic_xmerl_xml
