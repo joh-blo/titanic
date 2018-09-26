@@ -11,8 +11,7 @@
 -behaviour(gen_statem).
 
 %% API
--export([do/4
-%	 process/2
+-export([do/5
 ]).
 
 %% gen_statem callbacks
@@ -37,12 +36,14 @@
 -record(state,{
 	  opt,          % (validate|flatten|customize|external) Parsing mode
 	  root,         % Absolute path to repo root in local environment
-	  tpd           % #tpd{}, a complete parsed TPD
+	  tpd,          % #tpd{}, a complete parsed TPD
+	  set           % Current parse set id
          }).
 
 
-do(Root,ProjPath,Updates,Opt) ->
-    case parse(Root,ProjPath,Opt) of
+do(Root,ProjPath,Updates,Opt,Set) ->
+    titanic_manager:init_set(Set),
+    case parse(Root,ProjPath,Opt,Set) of
 	Res when is_record(Res,tpd) ->
 	    if
 		Opt==flatten ->
@@ -57,13 +58,13 @@ do(Root,ProjPath,Updates,Opt) ->
 
 
 %% Parse a TPD file (an XML standard to control building a binary from TTCN-3)
-parse(Root,ProjPath,Opt) ->
+parse(Root,ProjPath,Opt,Set) ->
     TPDfileIn=filename:basename(ProjPath),
     TPDfileDir=filename:dirname(ProjPath),
     FilePath=filename:join([Root,ProjPath]),
     case file:read_file(FilePath) of
 	{ok,Content} ->
-	    do_parse(Content,Root,TPDfileDir,Opt);
+	    do_parse(Content,Root,TPDfileDir,Opt,Set);
 	Error ->
 	    io:format("Cannot read~n"
 		      " ~p from~n"
@@ -74,8 +75,8 @@ parse(Root,ProjPath,Opt) ->
 
 
 
-do_parse(Content0,Root,TPDfileDir,Opt) ->
-    Pid=start_parser(Root,TPDfileDir,Opt),
+do_parse(Content0,Root,TPDfileDir,Opt,Set) ->
+    Pid=start_parser(Root,TPDfileDir,Opt,Set),
     Content=if
 		is_binary(Content0) -> binary_to_list(Content0);
 		is_list(Content0) -> Content0
@@ -194,8 +195,8 @@ apply_updates([{Match,Val}|Rest],Path) ->
 %% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
 %% @end
 %%--------------------------------------------------------------------
-start_parser(Root,TPDfileDir,Opt) ->
-    case gen_statem:start_link(?MODULE,[Root,TPDfileDir,Opt],[]) of
+start_parser(Root,TPDfileDir,Opt,Set) ->
+    case gen_statem:start_link(?MODULE,[Root,TPDfileDir,Opt,Set],[]) of
 	{ok,Pid} ->
 	    Pid;
 	{already_started,Pid} ->
@@ -228,11 +229,12 @@ callback_mode() -> state_functions.
 %% @end
 -spec init(Args :: term()) ->
 		  gen_statem:init_result(atom()).
-init([Root,TPDfileDir,Opt]) ->
+init([Root,TPDfileDir,Opt,Set]) ->
     {ok,'TITAN_Project_File_Information',
      #state{opt=Opt,
 	    root=Root,
-	    tpd=#tpd{path=shorten_path(TPDfileDir)}
+	    tpd=#tpd{path=titanic_lib:shorten_path(TPDfileDir)},
+	    set=Set
 	   }}.
 
 %%--------------------------------------------------------------------
@@ -289,10 +291,11 @@ init([Root,TPDfileDir,Opt]) ->
 		     State=#state{opt=Opt,
 				  tpd=Tpd=#tpd{path=TPDfileDir,
 					       ref_projects=RefProjects},
-				  root=Root
+				  root=Root,
+				  set=Set
 				 }) ->
     %% Expand the ReferencedProject
-    RefTpd=expand_project(E,Root,TPDfileDir,Opt),
+    RefTpd=expand_project(E,Root,TPDfileDir,Opt,Set),
     NewTpd=Tpd#tpd{ref_projects=[{E,RefTpd}|RefProjects]},
     NewState=State#state{tpd=NewTpd},
     {next_state,'ReferencedProjects', NewState};
@@ -317,9 +320,10 @@ init([Root,TPDfileDir,Opt]) ->
 	State=#state{tpd=Tpd=#tpd{name=TpdName,
 				  path=TPDfileDir,
 				  files=Files},
-		     root=Root
+		     root=Root,
+		     set=Set
 		    }) ->
-    check_file(E,TpdName,Root,TPDfileDir),
+    check_file(E,TpdName,Root,TPDfileDir,Set),
     NewTpd=Tpd#tpd{files=[E|Files]},
     {next_state,'Files', State#state{tpd=NewTpd}};
 'Files'(cast,E,State)
@@ -420,19 +424,19 @@ stop_parser(Pid) ->
 %%% ============================================================================
 %% Update paths etc. in the elements
 
-check_file(#xmlElement{attributes=OldA},TpdName,Root,TPDfileDir) ->
+check_file(#xmlElement{attributes=OldA},TpdName,Root,TPDfileDir,Set) ->
     OldPath=lookup_attribute(relativeURI,OldA),
-    FilePath=shorten_path(filename:join([Root,TPDfileDir,OldPath])),
+    FilePath=titanic_lib:shorten_path(filename:join([Root,TPDfileDir,OldPath])),
     ProjName=projname(TpdName),
-    titanic_manager:check_file(FilePath,ProjName).
+    titanic_manager:insert_file(FilePath,ProjName,Set).
 
 
-expand_project(#xmlElement{attributes=OldA},Root,TPDfileDir,Opt) ->
+expand_project(#xmlElement{attributes=OldA},Root,TPDfileDir,Opt,Set) ->
     RelativeProjPath=lookup_attribute(projectLocationURI,OldA),
     ProjPath=filename:join([TPDfileDir,RelativeProjPath]),
-    FilePath=shorten_path(filename:join([Root,ProjPath])),
-    titanic_manager:check_project(FilePath),
-    parse(Root,ProjPath,Opt).
+    FilePath=titanic_lib:shorten_path(filename:join([Root,ProjPath])),
+    titanic_manager:insert_project(FilePath,Set),
+    parse(Root,ProjPath,Opt,Set).
 
 
 
@@ -516,17 +520,4 @@ update_attribute(K,NewV,Attrs) ->
 projname(#xmlElement{name='ProjectName',
 		     content=[#xmlText{value=Content}]}) ->
     Content.
-
-
-
-%% Remove any ".." in a path, if possible.
-shorten_path(Path) ->
-    shorten_path2(filename:split(Path),[]).
-
-shorten_path2([],Out) ->
-    filename:join(lists:reverse(Out));
-shorten_path2([".."|Rest],[_|Out]) ->
-    shorten_path2(Rest,Out);
-shorten_path2([H|Rest],Out) ->
-    shorten_path2(Rest,[H|Out]).
 

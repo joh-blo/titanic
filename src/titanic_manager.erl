@@ -12,8 +12,11 @@
 
 %% API
 -export([start_link/0,
-	 reset/0,
-	 check_project/1,check_file/2,
+	 reset/0,reset/1,
+	 init_set/1,
+	 insert_project/2,
+	 insert_file/3,
+	 diff/2,
 	 status/0,status/1]).
 
 %% gen_server callbacks
@@ -26,7 +29,7 @@
 
 -record(state,{
 	  projs::list(),  % All projects we depend on
-	  files::list(),  % All files part of the main project
+	  sets::list(),   % All sets, where each set consists of [{file,proj}..]
 	  configs::list(),% All configs
 	  status::list()  % Key/Value list with current status
 	 }).
@@ -48,8 +51,13 @@ start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 
+init_set(Set) ->
+    gen_server:call(?MODULE,{init_set,Set}).
+
 reset() ->
     gen_server:call(?MODULE,{reset,all}).
+reset(Set) ->
+    gen_server:call(?MODULE,{reset,Set}).
 
 status() ->
     gen_server:call(?MODULE,{status,all}).
@@ -57,11 +65,14 @@ status() ->
 status(Key) ->
     gen_server:call(?MODULE,{status,Key}).
 
-check_project(ProjPath) ->
-    gen_server:cast(?MODULE,{check_proj,ProjPath}).
+insert_project(ProjPath,Set) ->
+    gen_server:cast(?MODULE,{insert_proj,ProjPath,Set}).
 
-check_file(FilePath,ProjName) ->
-    gen_server:cast(?MODULE,{check_file,FilePath,ProjName}).
+insert_file(FilePath,ProjName,Set) ->
+    gen_server:cast(?MODULE,{insert_file,FilePath,ProjName,Set}).
+
+diff(Set1,Set2) ->
+    gen_server:cast(?MODULE,{diff,Set1,Set2}).
 
 
 %%%===================================================================
@@ -82,7 +93,7 @@ check_file(FilePath,ProjName) ->
 init([]) ->
     process_flag(trap_exit, true),
     {ok, #state{projs=[],
-		files=[],
+		sets=[],
 		configs=[],
 		status=[]}}.
 
@@ -100,15 +111,47 @@ init([]) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_call({reset,all}, _From, State) ->
-    %% Read the current status    
+handle_call({init_set,Set}, _From, State=#state{sets=Sets}) ->
+    %% Read the current status
+    NewSets=case proplists:get_value(Set,Sets) of
+		undefined ->
+		    [{Set,[]}|Sets];
+		_ ->
+		    lists:keyreplace(Set,1,Sets,{Set,[]})
+	    end,
     Reply=ok,
-    {reply, Reply, State#state{files=[],projs=[],configs=[],status=[]}};
-handle_call({status,Key}, _From, State=#state{status=Status}) ->
+%    io:format("INIT SET ~p~n",[Set]),
+    {reply, Reply, State#state{sets=NewSets}};
+handle_call({reset,all}, _From, State) ->
+    Reply=ok,
+%    io:format("RESET ALL SETS~n",[]),
+    {reply, Reply, State#state{sets=[],projs=[],configs=[],status=[]}};
+handle_call({reset,Set}, _From, State=#state{sets=Sets}) ->
+    Reply=ok,
+    NewSets=case proplists:get_value(Set,Sets) of
+		undefined ->
+		    Sets;
+		_ ->
+		    lists:keyreplace(Set,1,Sets,{Set,[]})
+	    end,
+%    io:format("RESET SET ~p~n",[Set]),
+    {reply, Reply, State#state{sets=NewSets,projs=[],configs=[],status=[]}};
+handle_call({status,Key}, _From, State=#state{status=Status,
+					      sets=Sets,
+					      projs=Projs,
+					      configs=Cfgs}) ->
     %% Read the current status    
-    Reply=if
-	      Key==validate ->
-		  proplists:get_value(validate,Status,true)
+    Reply=case Key of
+	      sets ->
+		  Sets;
+	      projs ->
+		  Projs;
+	      configs ->
+		  Cfgs;
+	      validate ->
+		  proplists:get_value(validate,Status,true);
+	      all ->
+		  Status
 	  end,
     {reply, Reply, State}.
 
@@ -123,11 +166,12 @@ handle_call({status,Key}, _From, State=#state{status=Status}) ->
 %%                                  {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_cast({check_file,FilePath,ProjName}, State=#state{files=Files,
-							 status=Status}) ->
+handle_cast({insert_file,FilePath,ProjName,Set},
+	    State=#state{sets=Sets,status=Status}) ->
     %% Checks if:
-    %% - The referd file exists.
+    %% - The file exists.
     %% - We refer to the same file in differnt locations.
+    Files=proplists:get_value(Set,Sets),
     FileName=filename:basename(FilePath),
     {NewFiles,NewStatus}=
 	case lists:keysearch(FileName,1,Files) of
@@ -141,21 +185,35 @@ handle_cast({check_file,FilePath,ProjName}, State=#state{files=Files,
 			   io:format("WARNING: ~p is missing!~n",[FilePath]),
 			   false
 		   end,
-		{[{FileName,ProjName}|Files],update_status(NS,validate,Status)};
-	    {value,{_,ProjName}} ->
+%    io:format("FilePath=~p~n ProjName=~p~n",[FilePath,ProjName]),
+		{[{FileName,FilePath,ProjName}|Files],
+		 update_status(NS,validate,Status)};
+	    {value,{_,_,ProjName}} ->
 		{Files,Status};
-	    {value,{_,OldProjName}} ->
+	    {value,{_,_,OldProjName}} ->
 		io:format("WARNING:"
 			  " Found ~p in ~p, but previously also in ~p~n",
 			  [FileName,ProjName,OldProjName]),
 		{Files,update_status(false,validate,Status)}
 	end,
-    {noreply, State#state{files=NewFiles,status=NewStatus}};
-handle_cast({check_proj,ProjPath},State=#state{projs=Projs,status=Status}) ->
+    NewSets=lists:keyreplace(Set,1,Sets,{Set,NewFiles}),
+%    io:format("NewSets ~p~n",[NewSets]),
+
+    {noreply, State#state{sets=NewSets,status=NewStatus}};
+handle_cast({diff,Set1,Set2}, State=#state{sets=Sets,status=Status}) ->
+    NewStatus=case equal_sets(Set1,Set2,Sets) of
+		  false ->
+		      update_status(false,validate,Status);
+		  true ->
+		      Status
+	      end,
+    {noreply, State#state{status=NewStatus}};
+handle_cast({insert_proj,ProjPath,Set},
+	    State=#state{projs=Projs,status=Status}) ->
     ProjName=filename:basename(ProjPath),
     {NewProjs,NewStatus}=
-	case lists:keysearch(ProjName,1,Projs) of
-	    false ->
+	case lookup_proj(ProjName,Projs,Set) of
+	    undefined ->
 		%% A new file, check if it exists!
 		NS=case file:read_file_info(ProjPath) of
 		       {ok,_} ->
@@ -165,10 +223,11 @@ handle_cast({check_proj,ProjPath},State=#state{projs=Projs,status=Status}) ->
 				     [ProjPath]),
 			   false
 		   end,
-		{[{ProjName,ProjPath}|Projs],update_status(NS,validate,Status)};
-	    {value,{_,ProjPath}} ->
+		Projs2=[{ProjName,ProjPath,Set}|Projs],
+		{Projs2,update_status(NS,validate,Status)};
+	    {ok,ProjPath} ->
 		{Projs,Status};
-	    {value,{_,OldProjPath}} ->
+	    {ok,OldProjPath} ->
 		io:format("WARNING: Found ~p project referenced both at~n"
 			  "  ~p~n"
 			  "AND~n"
@@ -177,6 +236,14 @@ handle_cast({check_proj,ProjPath},State=#state{projs=Projs,status=Status}) ->
 		{Projs,Status}
 	end,
     {noreply, State#state{projs=NewProjs,status=NewStatus}}.
+
+
+lookup_proj([],_ProjName,_Set) ->
+    undefined;
+lookup_proj([{ProjName,ProjPath,Set}|_],ProjName,Set) ->
+    {ok,ProjPath};
+lookup_proj([_|Rest],ProjName,Set) ->
+    lookup_proj(Rest,ProjName,Set).
 
 
 update_status(true,_Key,Status) ->
@@ -233,6 +300,24 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+equal_sets(Set1,Set2,Sets) ->
+    S1=proplists:get_value(Set1,Sets),
+    S2=proplists:get_value(Set2,Sets),
+    case diff_lists(S1,S2) of
+	{[],[]} ->
+	    true;
+	{OnlyS1,OnlyS2} ->
+	    io:format("Sets differ!~n"
+		      " Only in ~p:~n~p~n"
+		      " Only in ~p:~n~p~n",
+		      [Set1,OnlyS1,Set2,OnlyS2]),
+	    false
+    end.
+
+diff_lists(S1,S2) ->
+    OnlyS1=S1--S2,
+    OnlyS2=S2--S1,
+    {OnlyS1,OnlyS2}.
 
 
 %% Increase the value of the "Key" counter with one.

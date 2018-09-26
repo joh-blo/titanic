@@ -12,6 +12,7 @@ MODULES= \
 	titanic_sup \
 	titanic_manager \
 	titanic_tpd \
+	titanic_lib \
 	titanic_xmerl \
 	titanic_xmerl_xml
 

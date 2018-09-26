@@ -10,9 +10,8 @@
 
 %% API
 -export([start/0,
-	 validate/2,
-	 flatten/2,flatten/3,
-	 external/4]).
+	 validate/3,
+	 flatten/2,flatten/3]).
 
 %%%===================================================================
 %%% API
@@ -26,9 +25,9 @@ start() ->
 
 %% validate- Parse and validate.
 %% Validates that all referenced projects and files in these actually exists.
-validate(GitRoot,ProjPath) ->
-    titanic_manager:reset(),
-    titanic_tpd:do(GitRoot,ProjPath,[],validate).
+validate(GitRoot,ProjPath,Set) ->
+    titanic_manager:reset(Set),
+    titanic_tpd:do(GitRoot,ProjPath,[],validate,Set).
     
 %% flatten - Flattens a tree with TPDs.
 %% + Search all referenced files and update all file paths according to the
@@ -41,15 +40,8 @@ flatten(GitRoot,ProjPath) ->
 flatten(GitRoot,ProjPath,Updates) ->
     TPDfileOut=filename:join("/tmp","FlatOut.tpd"),
     titanic_manager:reset(),
-    Str=titanic_tpd:do(GitRoot,ProjPath,Updates,flatten),
+    Str=titanic_tpd:do(GitRoot,ProjPath,Updates,flatten,1),
     file:write_file(TPDfileOut,Str).
-
-
-%% + external - Hook for external, user defined actions defined in a callback
-%% module. Includes a validate/2
-external(GitRoot,ProjPath,Updates,CB) ->
-    titanic_manager:reset(),
-    titanic_tpd:do(GitRoot,ProjPath,Updates,{external,CB}).
 
 
 %%--------------------------------------------------------------------
